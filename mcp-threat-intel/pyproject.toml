@@ -1,0 +1,35 @@
+[project]
+name = "mcp-threat-intel"
+version = "0.1.0"
+description = "MCP server for IP, domain, and file-hash reputation lookups via AbuseIPDB and VirusTotal"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "mcp[cli]>=2.0",
+  "httpx>=0.27",
+]
+
+[project.scripts]
+mcp-threat-intel = "mcp_threat_intel.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_threat_intel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "C4", "SIM", "PIE"]
+ignore = ["S105", "S106"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
