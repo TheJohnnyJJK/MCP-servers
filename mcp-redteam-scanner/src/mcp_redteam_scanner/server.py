@@ -15,30 +15,30 @@ from collections import Counter
 
 from mcp.server.mcpserver import MCPServer
 
-from .client import QualifyEndpointTarget
-from .schema import load_attack_cases
+from .client import QualifyEndpointTarget, TargetHttpClient
+from .schema import TargetProfile, load_attack_cases
 from .scorer import grade
 from .taxonomy import classify
 
 mcp = MCPServer(
     name="redteam-scanner",
     instructions=(
-        "Prompt-injection-tests any agent endpoint that accepts POST /qualify "
-        "with a lead payload and returns a tier/owner verdict. Use "
-        "scan_qualify_endpoint to run the full 18-case golden attack set "
-        "against a live target."
+        "Prompt-injection-tests a live agent endpoint. scan_qualify_endpoint runs the "
+        "full 18-case golden attack set against a target that speaks Lead Router's own "
+        "/qualify contract verbatim; scan_endpoint runs the same cases against ANY "
+        "endpoint that accepts a lead-like submission and returns a classification "
+        "decision, via a field_map/response_map translation."
     ),
 )
 
 
-def _run_scan(base_url: str, api_key: str | None, has_guardrails: bool) -> dict:
+def _run_scan(target: TargetHttpClient, has_guardrails: bool) -> dict:
     cases = load_attack_cases()
-    client = QualifyEndpointTarget(base_url=base_url, api_key=api_key)
     records = []
     for case in cases:
         started = time.perf_counter()
         try:
-            response = client.send(case)
+            response = target.send(case)
             error = None
         except Exception as exc:  # noqa: BLE001 - a hard failure is itself a finding
             response = None
@@ -100,7 +100,55 @@ def scan_qualify_endpoint(
     per-failure-layer breakdown, and the list of cases that did NOT
     hold (each with its attack_id, category, and latency).
     """
-    return _run_scan(base_url, api_key, assume_guardrails)
+    return _run_scan(QualifyEndpointTarget(base_url=base_url, api_key=api_key), assume_guardrails)
+
+
+@mcp.tool()
+def scan_endpoint(
+    base_url: str,
+    path: str = "/qualify",
+    api_key: str | None = None,
+    api_key_header: str = "X-API-Key",
+    field_map: dict[str, str | None] | None = None,
+    response_map: dict[str, str] | None = None,
+    assume_guardrails: bool = True,
+    timeout: float = 60.0,
+) -> dict:
+    """Runs the same 18-case golden attack set as scan_qualify_endpoint,
+    but against ANY endpoint that accepts a lead-like submission (a
+    free-text field plus a few structured ones) and returns a
+    classification decision plus free-text reasoning - not just an
+    exact clone of Lead Router's own field names and response shape.
+
+    base_url/path: the scanner POSTs to f"{base_url}{path}".
+    api_key/api_key_header: sent as a header if the target requires one.
+    field_map: translates this scanner's canonical request fields
+        (name, email, company, phone, message, source) onto the
+        target's own field names, as dotted paths for a nested body
+        (e.g. {"message": "input.text"}). Map a field to null to omit
+        it entirely. Fields not listed are sent under their own name
+        unchanged.
+    response_map: same idea for the canonical response fields (tier,
+        suggested_owner, icp_fit_score, urgency_score, reasoning,
+        confidence) - a dotted path into the target's own JSON response
+        (e.g. {"tier": "result.classification"}). Fields not listed are
+        read under their own name unchanged. Only tier, suggested_owner,
+        and reasoning are actually required for grading to run; leave
+        the rest unset if the target has no equivalent.
+    assume_guardrails: same meaning as on scan_qualify_endpoint.
+
+    Returns the same shape as scan_qualify_endpoint.
+    """
+    profile = TargetProfile(
+        base_url=base_url,
+        path=path,
+        api_key=api_key,
+        api_key_header=api_key_header,
+        field_map=field_map or {},
+        response_map=response_map or {},
+        timeout=timeout,
+    )
+    return _run_scan(TargetHttpClient(profile), assume_guardrails)
 
 
 @mcp.tool()

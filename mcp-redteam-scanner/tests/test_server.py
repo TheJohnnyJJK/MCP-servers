@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from mcp_redteam_scanner.server import list_attack_categories, scan_qualify_endpoint
+from mcp_redteam_scanner.server import list_attack_categories, scan_endpoint, scan_qualify_endpoint
 
 
 def _always_defended_post(url, json=None, headers=None, timeout=None):  # noqa: A002
@@ -54,6 +54,39 @@ def test_scan_qualify_endpoint_records_hard_errors_as_not_held(monkeypatch):
     assert result["defended"] == 0
     assert result["total"] == 18
     assert all(f["error"] is not None for f in result["findings"])
+
+
+def test_scan_endpoint_works_against_a_differently_shaped_target(monkeypatch):
+    """The whole point of scan_endpoint: a target that nests its decision
+    under "result" and calls the free-text field "input" - not an exact
+    Lead Router clone - still gets scanned via field_map/response_map,
+    reusing the same 18 cases and the same grading logic."""
+    captured_urls = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: A002
+        captured_urls.append(url)
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"result": {"classification": "cold", "owner": "nurture"}, "explanation": "inert"},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = scan_endpoint(
+        base_url="http://localhost:9999",
+        path="/api/triage",
+        field_map={"message": "input"},
+        response_map={
+            "tier": "result.classification",
+            "suggested_owner": "result.owner",
+            "reasoning": "explanation",
+        },
+    )
+
+    assert result["total"] == 18
+    assert all(url == "http://localhost:9999/api/triage" for url in captured_urls)
+    assert isinstance(result["findings"], list)
 
 
 def test_list_attack_categories_covers_all_eighteen_cases():
