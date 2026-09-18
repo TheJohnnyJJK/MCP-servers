@@ -12,7 +12,8 @@ and its own install count.
   for [agent-red-team](https://github.com/TheJohnnyJJK/Agent-Red-Team) -
   `scan_qualify_endpoint` for a target that speaks Lead Router's own
   `/qualify` contract verbatim, `scan_endpoint` for any lead-in/
-  decision-out agent via a configurable field mapping.
+  decision-out agent via a configurable field mapping. Both refuse to
+  run without an explicit, audited authorization scope.
 - **[mcp-threat-intel](mcp-threat-intel/)** - IP, domain, and file-hash
   reputation lookups via AbuseIPDB and VirusTotal.
 - **[mcp-cve-feed](mcp-cve-feed/)** - search and lookup against the

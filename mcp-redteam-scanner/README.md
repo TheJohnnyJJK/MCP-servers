@@ -26,16 +26,45 @@ already matches Lead Router's contract exactly.
 
 **A note on `base_url`:** both tools fire 18 real HTTP requests at
 whatever URL you give them, on purpose - that's what a scanner does.
-Run this as a local, single-user tool pointed only at services you own
-or have explicit authorization to test - `scan_endpoint` in particular
-exists to make that URL someone *else's* agent, which makes the
-authorization boundary the operator's responsibility, not something
-this tool can verify on its own. Don't wire either tool into an MCP
-client that also processes untrusted external content (a fetched
-webpage, an inbound email) without first making sure that content can't
-choose `base_url` - otherwise you've built the exact
-SSRF-via-prompt-injection chain this whole project is about defending
-against.
+Both now refuse to fire any of them without an explicit authorization
+scope alongside `base_url` - see "Authorization" below. That scope is
+still a self-attested claim, not something this tool can verify against
+a target's real owner, so run it as a local, single-user tool pointed
+only at services you own or have explicit permission to test. Don't
+wire either tool into an MCP client that also processes untrusted
+external content (a fetched webpage, an inbound email) without first
+making sure that content can't choose `base_url` or the authorization
+arguments - otherwise you've built the exact SSRF-via-prompt-injection
+chain this whole project is about defending against.
+
+## Authorization
+
+Neither tool will send a single request until you supply, alongside
+`base_url`:
+
+- `target_host` - the hostname you're authorizing this scan for.
+  Rejected if it doesn't match the host `base_url` actually resolves
+  to - this is what stops a stale or mismatched authorization from
+  silently covering a different target than the one it was written for.
+- `authorized_by` / `contact` - who's asserting this authorization, and
+  who to reach about the engagement.
+- `valid_from` / `valid_until` - the engagement window (ISO datetimes)
+  this scan must fall inside, checked against the current time.
+- `i_have_authorization` - must be explicitly `true`. There's no
+  default that authorizes anything.
+- `notes` (optional) - anything worth recording alongside this attempt,
+  e.g. `"own staging deploy"` or `"bug bounty program ref #1234"`.
+
+This can't cryptographically verify that a target's real owner
+consented - there's no PKI handshake with a third party here. What it
+buys instead is a deliberate speed bump plus a paper trail: every scan
+requires consciously stating who authorized it and for which host
+before anything fires, and **every attempt - authorized or rejected -
+is written to a local, append-only audit log** (`audit_log.py`,
+default `~/.mcp-redteam-scanner/audit_log.jsonl`, overridable via
+`REDTEAM_SCANNER_AUDIT_LOG`). `list_scan_history(limit=20)` reads it
+back. That turns "I only meant to test my own service" from an
+unverifiable claim into something with a timestamped record behind it.
 
 ## What it tests
 
@@ -59,17 +88,21 @@ actual response against a ground-truth answer written into the fixture.
 
 ## Tools
 
-- **`scan_qualify_endpoint(base_url, api_key=None, assume_guardrails=True)`**
+- **`scan_qualify_endpoint(base_url, target_host, authorized_by, contact, valid_from, valid_until, i_have_authorization, notes="", api_key=None, assume_guardrails=True)`**
   Runs all 18 cases against a live target that speaks Lead Router's own
   `/qualify` contract exactly, and returns defended/total counts, a
   per-category breakdown, a failure-layer breakdown (system_prompt /
   model / output_handling), and the list of findings that didn't hold.
-- **`scan_endpoint(base_url, path="/qualify", api_key=None, api_key_header="X-API-Key", field_map=None, response_map=None, assume_guardrails=True, timeout=60.0)`**
-  Same 18 cases, same grading, same return shape as
-  `scan_qualify_endpoint` - but against any endpoint, via
+  See "Authorization" above for the first six arguments.
+- **`scan_endpoint(base_url, target_host, authorized_by, contact, valid_from, valid_until, i_have_authorization, notes="", path="/qualify", api_key=None, api_key_header="X-API-Key", field_map=None, response_map=None, assume_guardrails=True, timeout=60.0)`**
+  Same 18 cases, same grading, same return shape and authorization gate
+  as `scan_qualify_endpoint` - but against any endpoint, via
   `field_map`/`response_map` translating this scanner's canonical field
   names onto the target's own (see "Scanning a differently-shaped
   target" below).
+- **`list_scan_history(limit=20)`**
+  Reads back the local audit log of scan attempts - authorized and
+  rejected alike - most recent first.
 - **`list_attack_categories()`**
   Lists the four categories with a case count and description each -
   useful for a client to show what a scan actually covers before
@@ -103,6 +136,12 @@ Example: a support-ticket triage bot that nests its decision under
 ```
 scan_endpoint(
   base_url="http://localhost:9000",
+  target_host="localhost",
+  authorized_by="jane",
+  contact="jane@example.com",
+  valid_from="2026-09-19T00:00:00Z",
+  valid_until="2026-09-26T00:00:00Z",
+  i_have_authorization=true,
   path="/api/triage",
   field_map={"message": "input"},
   response_map={
@@ -147,10 +186,13 @@ python -m mcp_redteam_scanner.server
 Once connected, ask your client something like:
 
 > Scan `http://localhost:8000` for prompt injection using the
-> redteam-scanner.
+> redteam-scanner - I own this service, authorize it for the next hour
+> under my name.
 
-It calls `scan_qualify_endpoint(base_url="http://localhost:8000")` and
-comes back with something like:
+It calls `scan_qualify_endpoint(base_url="http://localhost:8000",
+target_host="localhost", authorized_by="...", contact="...",
+valid_from=..., valid_until=..., i_have_authorization=true)` and comes
+back with something like:
 
 ```json
 {
@@ -190,6 +232,14 @@ outside whether a target has any prompt-level defense at all. It only
 affects which layer a failure gets blamed on in `by_failure_layer`, never
 the pass/fail result itself.
 
+The authorization gate (`authorization.py`) is a similarly honest piece
+of scope: `EngagementScope` can't verify a claim against a target's
+real owner, so it doesn't pretend to. What it enforces is narrower and
+checkable - the scan is currently within its stated time window, and
+aimed at the exact host the operator named - and what it guarantees is
+a record, not a proof: every attempt, rejected or not, lands in
+`audit_log.py`'s append-only log before either tool returns.
+
 ## Development
 
 ```bash
@@ -200,5 +250,6 @@ uv pip install pytest ruff --python .venv
 .venv/Scripts/python -m ruff check src tests
 ```
 
-22 offline tests, no network calls, no API keys required - they mock
-every HTTP boundary the same way agent-red-team's tests do.
+40 offline tests, no network calls, no API keys required - they mock
+every HTTP boundary the same way agent-red-team's tests do, and isolate
+the audit log to a temp file per test.

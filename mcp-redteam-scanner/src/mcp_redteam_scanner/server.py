@@ -10,11 +10,14 @@ Or point an MCP client (Claude Desktop, Cursor, etc.) at the
 """
 from __future__ import annotations
 
+import datetime
 import time
 from collections import Counter
 
 from mcp.server.mcpserver import MCPServer
 
+from .audit_log import read_recent_scans, record_scan_attempt
+from .authorization import EngagementScope, ScopeViolation, require_scope
 from .client import QualifyEndpointTarget, TargetHttpClient
 from .schema import TargetProfile, load_attack_cases
 from .scorer import grade
@@ -27,9 +30,52 @@ mcp = MCPServer(
         "full 18-case golden attack set against a target that speaks Lead Router's own "
         "/qualify contract verbatim; scan_endpoint runs the same cases against ANY "
         "endpoint that accepts a lead-like submission and returns a classification "
-        "decision, via a field_map/response_map translation."
+        "decision, via a field_map/response_map translation. Both require an explicit "
+        "authorization scope (target_host, authorized_by, contact, a valid_from/"
+        "valid_until window, and i_have_authorization=true) before a single request "
+        "fires - only scan a host you own or have explicit permission to test. Every "
+        "attempt, authorized or rejected, is written to a local audit log; "
+        "list_scan_history reads it back."
     ),
 )
+
+
+def _authorize_or_raise(
+    *,
+    tool: str,
+    base_url: str,
+    target_host: str,
+    authorized_by: str,
+    contact: str,
+    valid_from: datetime.datetime,
+    valid_until: datetime.datetime,
+    i_have_authorization: bool,
+    notes: str,
+) -> EngagementScope:
+    """Builds the EngagementScope both scan tools require, checks it
+    against base_url, and logs the outcome either way - a rejection is
+    logged and re-raised before the caller ever gets near httpx, and an
+    approval is returned for the caller to log again once the scan
+    itself finishes (see record_scan_attempt's docstring on why a
+    rejection is worth recording at all)."""
+    scope = EngagementScope(
+        target_host=target_host,
+        authorized_by=authorized_by,
+        contact=contact,
+        valid_from=valid_from,
+        valid_until=valid_until,
+        notes=notes,
+        i_have_authorization=i_have_authorization,
+    )
+    try:
+        require_scope(scope, base_url)
+    except ScopeViolation as exc:
+        record_scan_attempt(
+            tool=tool, base_url=base_url, scope=scope, outcome="rejected",
+            rejection_reason=str(exc),
+        )
+        raise
+    return scope
 
 
 def _run_scan(target: TargetHttpClient, has_guardrails: bool) -> dict:
@@ -81,14 +127,38 @@ def _summarize(records: list[dict]) -> dict:
 @mcp.tool()
 def scan_qualify_endpoint(
     base_url: str,
+    target_host: str,
+    authorized_by: str,
+    contact: str,
+    valid_from: datetime.datetime,
+    valid_until: datetime.datetime,
+    i_have_authorization: bool,
+    notes: str = "",
     api_key: str | None = None,
     assume_guardrails: bool = True,
 ) -> dict:
     """Runs the 18-case golden prompt-injection set against a live
     /qualify-compatible endpoint and returns a pass/fail summary.
 
+    Refuses to send a single request unless the authorization
+    parameters below check out - see "Authorization" in the module
+    instructions. Only scan a host you own or have explicit permission
+    to test.
+
     base_url: the target's root URL, e.g. "http://localhost:8000" - the
         scanner POSTs to f"{base_url}/qualify".
+    target_host: the hostname you're authorizing this scan for (e.g.
+        "localhost" or "staging.example.com") - rejected if it doesn't
+        match the host base_url actually resolves to.
+    authorized_by/contact: who's asserting this authorization, and who
+        to reach about the engagement. Free text, recorded in the audit
+        log either way.
+    valid_from/valid_until: the engagement window this scan must fall
+        inside, checked against the current time.
+    i_have_authorization: must be explicitly true - there's no default
+        that authorizes a scan.
+    notes: anything worth recording alongside this attempt (e.g. "own
+        staging deploy" or "bug bounty program ref #1234").
     api_key: sent as an X-API-Key header if the target requires one.
     assume_guardrails: hint used only to attribute WHICH layer a failure
         blames (system_prompt vs model vs output_handling) in the
@@ -100,12 +170,29 @@ def scan_qualify_endpoint(
     per-failure-layer breakdown, and the list of cases that did NOT
     hold (each with its attack_id, category, and latency).
     """
-    return _run_scan(QualifyEndpointTarget(base_url=base_url, api_key=api_key), assume_guardrails)
+    scope = _authorize_or_raise(
+        tool="scan_qualify_endpoint", base_url=base_url, target_host=target_host,
+        authorized_by=authorized_by, contact=contact, valid_from=valid_from,
+        valid_until=valid_until, i_have_authorization=i_have_authorization, notes=notes,
+    )
+    result = _run_scan(QualifyEndpointTarget(base_url=base_url, api_key=api_key), assume_guardrails)
+    record_scan_attempt(
+        tool="scan_qualify_endpoint", base_url=base_url, scope=scope, outcome="scanned",
+        summary={"defended": result["defended"], "total": result["total"]},
+    )
+    return result
 
 
 @mcp.tool()
 def scan_endpoint(
     base_url: str,
+    target_host: str,
+    authorized_by: str,
+    contact: str,
+    valid_from: datetime.datetime,
+    valid_until: datetime.datetime,
+    i_have_authorization: bool,
+    notes: str = "",
     path: str = "/qualify",
     api_key: str | None = None,
     api_key_header: str = "X-API-Key",
@@ -119,6 +206,11 @@ def scan_endpoint(
     free-text field plus a few structured ones) and returns a
     classification decision plus free-text reasoning - not just an
     exact clone of Lead Router's own field names and response shape.
+
+    Same authorization gate as scan_qualify_endpoint (target_host,
+    authorized_by, contact, valid_from/valid_until, i_have_authorization,
+    notes) - see that tool's docstring for what each means. Only scan a
+    host you own or have explicit permission to test.
 
     base_url/path: the scanner POSTs to f"{base_url}{path}".
     api_key/api_key_header: sent as a header if the target requires one.
@@ -139,6 +231,11 @@ def scan_endpoint(
 
     Returns the same shape as scan_qualify_endpoint.
     """
+    scope = _authorize_or_raise(
+        tool="scan_endpoint", base_url=base_url, target_host=target_host,
+        authorized_by=authorized_by, contact=contact, valid_from=valid_from,
+        valid_until=valid_until, i_have_authorization=i_have_authorization, notes=notes,
+    )
     profile = TargetProfile(
         base_url=base_url,
         path=path,
@@ -148,7 +245,21 @@ def scan_endpoint(
         response_map=response_map or {},
         timeout=timeout,
     )
-    return _run_scan(TargetHttpClient(profile), assume_guardrails)
+    result = _run_scan(TargetHttpClient(profile), assume_guardrails)
+    record_scan_attempt(
+        tool="scan_endpoint", base_url=base_url, scope=scope, outcome="scanned",
+        summary={"defended": result["defended"], "total": result["total"]},
+    )
+    return result
+
+
+@mcp.tool()
+def list_scan_history(limit: int = 20) -> list[dict]:
+    """Reads back the local audit log of scan attempts (authorized and
+    rejected alike) written by scan_qualify_endpoint/scan_endpoint -
+    most recent first. Returns an empty list if nothing's been scanned
+    yet from this machine."""
+    return read_recent_scans(limit=limit)
 
 
 @mcp.tool()
