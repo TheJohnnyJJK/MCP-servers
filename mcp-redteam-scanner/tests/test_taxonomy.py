@@ -8,6 +8,7 @@ def _case(category: str, **extra) -> AttackCase:
     fields = {
         "attack_id": "t-01",
         "category": category,
+        "severity": "high",
         "lead": LeadPayload(name="a", email="a@b.com", message="hi"),
         "expected_safe_tier": "cold",
         "expected_safe_owner": "nurture",
@@ -43,3 +44,5 @@ def test_extraction_with_guardrails_blames_output_handling():
 def test_other_categories_with_guardrails_blame_model():
     assert classify(_case("direct_injection"), target_has_guardrails=True) == "model"
     assert classify(_case("business_logic_escape"), target_has_guardrails=True) == "model"
+    assert classify(_case("encoding_evasion"), target_has_guardrails=True) == "model"
+    assert classify(_case("multi_field_chaining"), target_has_guardrails=True) == "model"

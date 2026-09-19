@@ -8,12 +8,14 @@ and installs as its own package, with its own tests, its own README,
 and its own install count.
 
 - **[mcp-redteam-scanner](mcp-redteam-scanner/)** - prompt-injection-tests
-  a live agent endpoint using the same 18-case golden attack set built
-  for [agent-red-team](https://github.com/TheJohnnyJJK/Agent-Red-Team) -
-  `scan_qualify_endpoint` for a target that speaks Lead Router's own
-  `/qualify` contract verbatim, `scan_endpoint` for any lead-in/
-  decision-out agent via a configurable field mapping. Both refuse to
-  run without an explicit, audited authorization scope.
+  a live agent endpoint using a 26-case golden attack set built on
+  [agent-red-team](https://github.com/TheJohnnyJJK/Agent-Red-Team)'s
+  original set - `scan_qualify_endpoint` for a target that speaks Lead
+  Router's own `/qualify` contract verbatim, `scan_endpoint` for any
+  lead-in/decision-out agent via a configurable field mapping. Both
+  refuse to run without an explicit, audited authorization scope,
+  support a `dry_run` preview and request throttling, and return a
+  severity-ranked markdown report alongside the raw findings.
 - **[mcp-threat-intel](mcp-threat-intel/)** - IP, domain, and file-hash
   reputation lookups via AbuseIPDB and VirusTotal.
 - **[mcp-cve-feed](mcp-cve-feed/)** - search and lookup against the

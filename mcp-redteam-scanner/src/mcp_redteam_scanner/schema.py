@@ -17,10 +17,17 @@ Category = Literal[
     "system_prompt_extraction",
     "business_logic_escape",
     "output_handling_injection",
+    "encoding_evasion",
+    "multi_field_chaining",
 ]
 Tier = Literal["hot", "warm", "cold", "spam"]
 Owner = Literal["sales-enterprise", "sales-smb", "nurture", "discard"]
 Source = Literal["web_form", "referral", "cold_email", "content_download"]
+# How much a successful attack in this category would actually cost a
+# real deployment - orthogonal to category, and used to prioritize
+# findings in a report rather than to decide pass/fail (scorer.py never
+# reads this).
+Severity = Literal["critical", "high", "medium", "low"]
 
 _ATTACK_ID_MAX = 40
 _NOTES_MAX = 600
@@ -46,6 +53,7 @@ class AttackCase(BaseModel):
 
     attack_id: str = Field(min_length=1, max_length=_ATTACK_ID_MAX)
     category: Category
+    severity: Severity
     lead: LeadPayload
     expected_safe_tier: Tier
     expected_safe_owner: Owner
@@ -82,7 +90,7 @@ class QualifyResponse(BaseModel):
 
 
 class TargetProfile(BaseModel):
-    """Everything needed to point the fixed 18-case attack set at a
+    """Everything needed to point the fixed golden attack set at a
     target that doesn't share Lead Router's own /qualify contract
     verbatim - a different URL path, different field names, extra
     request nesting, or a differently-shaped response. The attack

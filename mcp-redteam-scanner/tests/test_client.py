@@ -85,6 +85,49 @@ def test_send_raises_on_http_error(monkeypatch):
         target.send(case)
 
 
+def test_build_request_does_not_call_httpx(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("build_request must never make a network call")
+
+    monkeypatch.setattr(httpx, "post", boom)
+
+    case = load_attack_cases()[0]
+    target = QualifyEndpointTarget(base_url="http://localhost:8000", api_key="secret")
+    request = target.build_request(case)
+
+    assert request["method"] == "POST"
+    assert request["url"] == "http://localhost:8000/qualify"
+    assert request["headers"] == {"X-API-Key": "secret"}
+    assert request["body"]["message"] == case.lead.message
+
+
+def test_send_uses_build_request_under_the_hood(monkeypatch):
+    """send() shouldn't duplicate build_request()'s translation logic -
+    changing field_map should be visible through both."""
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: A002
+        captured["url"] = url
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"tier": "cold", "suggested_owner": "nurture", "reasoning": "ok"},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    case = load_attack_cases()[0]
+    profile = TargetProfile(base_url="http://localhost:9000", field_map={"message": "text"})
+    target = TargetHttpClient(profile)
+    built = target.build_request(case)
+    target.send(case)
+
+    assert captured["url"] == built["url"]
+    assert captured["json"] == built["body"]
+    assert "text" in captured["json"]
+
+
 def test_target_http_client_translates_request_fields_via_field_map(monkeypatch):
     """A third-party endpoint that calls the free-text field "input" and
     nests everything under "lead" instead of Lead Router's own flat

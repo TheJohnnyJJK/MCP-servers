@@ -52,7 +52,7 @@ def record_scan_attempt(
         "authorized_by": scope.authorized_by,
         "contact": scope.contact,
         "notes": scope.notes,
-        "outcome": outcome,  # "scanned" | "rejected"
+        "outcome": outcome,  # "scanned" | "rejected" | "dry_run"
         "rejection_reason": rejection_reason,
         "summary": summary,
     }

@@ -61,20 +61,24 @@ def test_scan_qualify_endpoint_reports_full_defense(monkeypatch):
 
     result = scan_qualify_endpoint(base_url="http://localhost:9999", **_valid_scope())
 
-    assert result["total"] == 18
+    assert result["total"] == 26
     # every case's expected_safe_tier/owner in the fixture set isn't
-    # actually "cold"/"nurture" for all 18, so a target that returns the
-    # same inert verdict for every case will fail some direct_injection
-    # cases whose expected safe verdict differs - assert the shape and
-    # the always-callable invariant, not a specific defended count here.
+    # actually "cold"/"nurture" for all of them, so a target that returns
+    # the same inert verdict for every case will fail some cases whose
+    # expected safe verdict differs - assert the shape and the
+    # always-callable invariant, not a specific defended count here.
     assert set(result) == {
         "defended",
         "total",
         "by_category",
         "by_failure_layer",
+        "by_severity",
         "findings",
+        "report",
     }
     assert isinstance(result["findings"], list)
+    assert isinstance(result["report"], str)
+    assert "Prompt-Injection Scan Report" in result["report"]
 
 
 def test_scan_qualify_endpoint_records_hard_errors_as_not_held(monkeypatch):
@@ -88,8 +92,9 @@ def test_scan_qualify_endpoint_records_hard_errors_as_not_held(monkeypatch):
     result = scan_qualify_endpoint(base_url="http://localhost:9999", **_valid_scope())
 
     assert result["defended"] == 0
-    assert result["total"] == 18
+    assert result["total"] == 26
     assert all(f["error"] is not None for f in result["findings"])
+    assert all("severity" in f for f in result["findings"])
 
 
 def test_scan_qualify_endpoint_refuses_when_target_host_does_not_match_base_url(monkeypatch):
@@ -131,7 +136,7 @@ def test_scan_endpoint_works_against_a_differently_shaped_target(monkeypatch):
     """The whole point of scan_endpoint: a target that nests its decision
     under "result" and calls the free-text field "input" - not an exact
     Lead Router clone - still gets scanned via field_map/response_map,
-    reusing the same 18 cases and the same grading logic."""
+    reusing the same golden attack set and the same grading logic."""
     captured_urls = []
 
     def fake_post(url, json=None, headers=None, timeout=None):  # noqa: A002
@@ -156,9 +161,10 @@ def test_scan_endpoint_works_against_a_differently_shaped_target(monkeypatch):
         **_valid_scope(),
     )
 
-    assert result["total"] == 18
+    assert result["total"] == 26
     assert all(url == "http://localhost:9999/api/triage" for url in captured_urls)
     assert isinstance(result["findings"], list)
+    assert isinstance(result["report"], str)
 
 
 def test_scan_endpoint_refuses_without_authorization(monkeypatch):
@@ -190,19 +196,87 @@ def test_scan_records_appear_in_scan_history(monkeypatch):
     assert history[0]["target_host"] == "rejected-host.com"
     assert history[1]["outcome"] == "scanned"
     assert history[1]["notes"] == "approved scan"
-    assert history[1]["summary"]["total"] == 18
+    assert history[1]["summary"]["total"] == 26
 
 
 def test_scan_history_is_empty_with_no_prior_scans():
     assert list_scan_history() == []
 
 
-def test_list_attack_categories_covers_all_eighteen_cases():
+def test_dry_run_previews_requests_without_calling_the_target(monkeypatch):
+    def boom(url, json=None, headers=None, timeout=None):  # noqa: A002
+        raise AssertionError("dry_run must never actually call the target")
+
+    monkeypatch.setattr(httpx, "post", boom)
+
+    result = scan_qualify_endpoint(
+        base_url="http://localhost:9999", dry_run=True, **_valid_scope()
+    )
+
+    assert result["dry_run"] is True
+    assert len(result["requests"]) == 26
+    first = result["requests"][0]
+    assert first["url"] == "http://localhost:9999/qualify"
+    assert first["method"] == "POST"
+    assert "body" in first
+    assert "severity" in first
+
+
+def test_dry_run_still_requires_authorization(monkeypatch):
+    def boom(url, json=None, headers=None, timeout=None):  # noqa: A002
+        raise AssertionError("should never reach httpx")
+
+    monkeypatch.setattr(httpx, "post", boom)
+
+    with pytest.raises(ScopeViolation):
+        scan_qualify_endpoint(
+            base_url="http://localhost:9999",
+            dry_run=True,
+            **_valid_scope(target_host="not-localhost"),
+        )
+
+
+def test_dry_run_is_logged_separately_in_scan_history(monkeypatch):
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+
+    scan_qualify_endpoint(base_url="http://localhost:9999", dry_run=True, **_valid_scope())
+
+    history = list_scan_history()
+    assert len(history) == 1
+    assert history[0]["outcome"] == "dry_run"
+    assert history[0]["summary"] == {"requests_previewed": 26}
+
+
+def test_delay_seconds_sleeps_between_requests_but_not_before_the_first(monkeypatch):
+    monkeypatch.setattr(httpx, "post", _always_defended_post)
+    sleeps = []
+    monkeypatch.setattr("mcp_redteam_scanner.server.time.sleep", sleeps.append)
+
+    scan_qualify_endpoint(
+        base_url="http://localhost:9999", delay_seconds=0.25, **_valid_scope()
+    )
+
+    assert sleeps == [0.25] * 25
+
+
+def test_delay_seconds_zero_never_sleeps(monkeypatch):
+    monkeypatch.setattr(httpx, "post", _always_defended_post)
+    monkeypatch.setattr(
+        "mcp_redteam_scanner.server.time.sleep",
+        lambda *_: (_ for _ in ()).throw(AssertionError("should not sleep at delay_seconds=0")),
+    )
+
+    scan_qualify_endpoint(base_url="http://localhost:9999", **_valid_scope())
+
+
+def test_list_attack_categories_covers_all_cases():
     categories = list_attack_categories()
-    assert sum(c["count"] for c in categories) == 18
+    assert sum(c["count"] for c in categories) == 26
     assert {c["category"] for c in categories} == {
         "direct_injection",
         "system_prompt_extraction",
         "business_logic_escape",
         "output_handling_injection",
+        "encoding_evasion",
+        "multi_field_chaining",
     }

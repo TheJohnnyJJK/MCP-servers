@@ -33,8 +33,10 @@ def classify(case: AttackCase, target_has_guardrails: bool) -> FailureLayer:
        whatever output-side leak check the target has (if any) missed
        it - an output-handling gap, not a prompt-framing one.
     4. Anything else with guardrails present (direct_injection,
-       business_logic_escape) blames model: the defense existed, the
-       model didn't follow it under pressure.
+       business_logic_escape, encoding_evasion, multi_field_chaining)
+       blames model: the defense existed, the model didn't follow it
+       under pressure - true whether the pressure was plaintext, an
+       obfuscated encoding, or split across several fields.
     """
     if case.category == "output_handling_injection":
         return "output_handling"

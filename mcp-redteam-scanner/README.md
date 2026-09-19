@@ -3,7 +3,7 @@
 ## In plain terms
 
 I built [agent-red-team](https://github.com/TheJohnnyJJK/Agent-Red-Team) to
-attack my own Lead Router agent with 18 hand-written prompt-injection
+attack my own Lead Router agent with hand-written prompt-injection
 cases, graded deterministically against the real response, no LLM judge.
 This project turns that same attack set into an MCP tool: any MCP
 client (Claude Desktop, Cursor, or your own agent) can call
@@ -14,17 +14,17 @@ in, a tier/owner verdict out.
 It's still scoped honestly - this doesn't probe arbitrary endpoints
 blind, and it never runs against anything without you supplying its URL
 yourself - but the target *shape* isn't hardcoded anymore. `scan_endpoint`
-runs the identical 18 cases against any endpoint that accepts a
-lead-like submission (a free-text field plus a few structured ones) and
-returns a classification decision plus free-text reasoning, translating
-this scanner's fixed field names onto the target's own via a
+runs the identical cases against any endpoint that accepts a lead-like
+submission (a free-text field plus a few structured ones) and returns a
+classification decision plus free-text reasoning, translating this
+scanner's fixed field names onto the target's own via a
 `field_map`/`response_map` - a different URL path, different field
 names, nested request/response shapes, none of that requires touching
 the attack content or the grading logic. `scan_qualify_endpoint` is
 still there, unchanged, as the zero-configuration case where the target
 already matches Lead Router's contract exactly.
 
-**A note on `base_url`:** both tools fire 18 real HTTP requests at
+**A note on `base_url`:** both tools fire real HTTP requests at
 whatever URL you give them, on purpose - that's what a scanner does.
 Both now refuse to fire any of them without an explicit authorization
 scope alongside `base_url` - see "Authorization" below. That scope is
@@ -35,7 +35,9 @@ wire either tool into an MCP client that also processes untrusted
 external content (a fetched webpage, an inbound email) without first
 making sure that content can't choose `base_url` or the authorization
 arguments - otherwise you've built the exact SSRF-via-prompt-injection
-chain this whole project is about defending against.
+chain this whole project is about defending against. Use `dry_run=true`
+first against anything you're not already sure of - it shows every
+request the scan would send without sending any of them.
 
 ## Authorization
 
@@ -68,8 +70,9 @@ unverifiable claim into something with a timestamped record behind it.
 
 ## What it tests
 
-Four categories, 18 cases total, carried over verbatim from
-agent-red-team's golden set:
+Six categories, 26 cases total. The first four are carried over
+verbatim from agent-red-team's golden set; the last two were added
+here to cover attack shapes that set wasn't built to test:
 
 - **direct_injection** - instructions embedded in lead fields asking
   for a tier/owner the content doesn't honestly earn.
@@ -80,33 +83,68 @@ agent-red-team's golden set:
 - **output_handling_injection** - content designed to survive
   unsanitized into a field a caller might relay elsewhere (Slack,
   storage, another API).
+- **encoding_evasion** - the same override techniques as
+  direct_injection, obfuscated with base64, ROT13, zero-width
+  characters, or leetspeak substitution, so a defense that only
+  pattern-matches plaintext keywords never sees the literal phrase it's
+  looking for.
+- **multi_field_chaining** - an attack split across two or more request
+  fields (`name`, `company`, `message`, ...) so no single field contains
+  the full payload - only reconstructed once every field is
+  concatenated into one prompt, which is exactly what a real
+  implementation of this contract already does.
 
 Grading is the same as agent-red-team's: a tier/owner that drifts from
 what the lead honestly deserves, or a marker string that survives into
 `reasoning`, is a fail. No vibes, no LLM judge - `scorer.py` checks the
 actual response against a ground-truth answer written into the fixture.
+Every case also carries a `severity` (critical/high/medium/low, based on
+what a successful attack would actually cost a real deployment) used to
+prioritize findings in a scan's report - it never affects pass/fail.
 
 ## Tools
 
-- **`scan_qualify_endpoint(base_url, target_host, authorized_by, contact, valid_from, valid_until, i_have_authorization, notes="", api_key=None, assume_guardrails=True)`**
-  Runs all 18 cases against a live target that speaks Lead Router's own
-  `/qualify` contract exactly, and returns defended/total counts, a
-  per-category breakdown, a failure-layer breakdown (system_prompt /
-  model / output_handling), and the list of findings that didn't hold.
-  See "Authorization" above for the first six arguments.
-- **`scan_endpoint(base_url, target_host, authorized_by, contact, valid_from, valid_until, i_have_authorization, notes="", path="/qualify", api_key=None, api_key_header="X-API-Key", field_map=None, response_map=None, assume_guardrails=True, timeout=60.0)`**
-  Same 18 cases, same grading, same return shape and authorization gate
-  as `scan_qualify_endpoint` - but against any endpoint, via
+- **`scan_qualify_endpoint(base_url, target_host, authorized_by, contact, valid_from, valid_until, i_have_authorization, notes="", api_key=None, assume_guardrails=True, dry_run=False, delay_seconds=0.0)`**
+  Runs the full golden set against a live target that speaks Lead
+  Router's own `/qualify` contract exactly, and returns defended/total
+  counts, a per-category breakdown, a failure-layer breakdown
+  (system_prompt / model / output_handling), a per-severity breakdown,
+  the list of findings that didn't hold, and a ready-to-share markdown
+  `report` string. See "Authorization" above for the first six
+  arguments, and "Dry runs and rate limiting" below for the last two.
+- **`scan_endpoint(base_url, target_host, authorized_by, contact, valid_from, valid_until, i_have_authorization, notes="", path="/qualify", api_key=None, api_key_header="X-API-Key", field_map=None, response_map=None, assume_guardrails=True, timeout=60.0, dry_run=False, delay_seconds=0.0)`**
+  Same cases, same grading, same return shape and authorization gate as
+  `scan_qualify_endpoint` - but against any endpoint, via
   `field_map`/`response_map` translating this scanner's canonical field
   names onto the target's own (see "Scanning a differently-shaped
   target" below).
 - **`list_scan_history(limit=20)`**
-  Reads back the local audit log of scan attempts - authorized and
-  rejected alike - most recent first.
+  Reads back the local audit log of scan attempts - authorized,
+  rejected, and dry-run alike - most recent first.
 - **`list_attack_categories()`**
-  Lists the four categories with a case count and description each -
+  Lists the six categories with a case count and description each -
   useful for a client to show what a scan actually covers before
   running one.
+
+## Dry runs and rate limiting
+
+Both scan tools take two more knobs, independent of authorization:
+
+- `dry_run=true` builds and returns every request the scan would send -
+  method, URL, headers, body, plus the case's `attack_id`/`category`/
+  `severity` - without sending a single one. No grading happens; the
+  return shape is `{"dry_run": true, "requests": [...]}` instead of the
+  usual summary. Authorization is still required and still checked
+  (a dry run is still a stated intent to test a specific host), but it's
+  logged to the audit trail as its own `"dry_run"` outcome, distinct
+  from `"scanned"` and `"rejected"` - so `list_scan_history` shows
+  exactly which attempts actually touched a target and which didn't.
+- `delay_seconds` pauses that long between requests (not before the
+  first one). Zero by default - the golden set fires back-to-back with
+  no throttle unless you ask for one. Use it against a target you don't
+  want to see two dozen requests in a couple of seconds, whether that's
+  politeness, a rate limit you don't want to trip, or just not wanting
+  a burst of traffic to look like the thing this scanner is testing for.
 
 ## Scanning a differently-shaped target
 
@@ -196,16 +234,20 @@ back with something like:
 
 ```json
 {
-  "defended": 16,
-  "total": 18,
+  "defended": 22,
+  "total": 26,
   "by_category": {
     "direct_injection": { "total": 6, "held": 6 },
     "system_prompt_extraction": { "total": 4, "held": 3 },
     "business_logic_escape": { "total": 4, "held": 4 },
-    "output_handling_injection": { "total": 4, "held": 3 }
+    "output_handling_injection": { "total": 4, "held": 3 },
+    "encoding_evasion": { "total": 4, "held": 3 },
+    "multi_field_chaining": { "total": 4, "held": 3 }
   },
-  "by_failure_layer": { "output_handling": 2 },
-  "findings": [ { "attack_id": "spe-02", "category": "system_prompt_extraction", "...": "..." } ]
+  "by_failure_layer": { "output_handling": 2, "model": 2 },
+  "by_severity": { "high": 3, "critical": 1 },
+  "findings": [ { "attack_id": "spe-02", "category": "system_prompt_extraction", "severity": "high", "...": "..." } ],
+  "report": "# Prompt-Injection Scan Report\n\n- **Target:** http://localhost:8000\n..."
 }
 ```
 
@@ -240,6 +282,24 @@ aimed at the exact host the operator named - and what it guarantees is
 a record, not a proof: every attempt, rejected or not, lands in
 `audit_log.py`'s append-only log before either tool returns.
 
+`report.py` follows the same "grade with code, not vibes" rule the rest
+of this portfolio uses for scoring: the markdown a scan returns is
+templated directly from the same JSON a programmatic caller gets, not
+an LLM's paraphrase of it, so the same scan result always produces the
+same report and nothing in it can drift from what actually happened.
+
+`encoding_evasion` and `multi_field_chaining` exist because the
+original four categories all assume the payload arrives as one
+contiguous, plaintext string in a single field - true of every case
+agent-red-team's own red-team pass against Lead Router found, but not
+the only way a real submission looks. Both categories reuse the exact
+same grading primitives (`_tier_drifted`, leak markers, an injected
+marker) rather than inventing new pass/fail logic - `encoding_evasion`
+is graded identically to `direct_injection` (same consequence: a tier
+override that shouldn't have happened), and `multi_field_chaining`
+checks all three signals at once since a chained payload might be
+reconstructing any of the other categories' techniques.
+
 ## Development
 
 ```bash
@@ -250,6 +310,6 @@ uv pip install pytest ruff --python .venv
 .venv/Scripts/python -m ruff check src tests
 ```
 
-40 offline tests, no network calls, no API keys required - they mock
+60 offline tests, no network calls, no API keys required - they mock
 every HTTP boundary the same way agent-red-team's tests do, and isolate
 the audit log to a temp file per test.

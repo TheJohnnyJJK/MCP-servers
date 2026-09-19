@@ -64,17 +64,29 @@ class TargetHttpClient:
             {profile.api_key_header: profile.api_key} if profile.api_key else {}
         )
 
-    def send(self, case: AttackCase) -> QualifyResponse:
+    def build_request(self, case: AttackCase) -> dict:
+        """Builds the exact URL/headers/body send() would POST, without
+        sending it - what a dry-run scan shows the operator instead of
+        firing anything at the target (see server.py's dry_run path)."""
         body: dict = {}
         for canonical_field, value in case.lead.model_dump(exclude_none=True).items():
             target_field = self.profile.field_map.get(canonical_field, canonical_field)
             if target_field is None:  # explicitly dropped - this target has no such field
                 continue
             _set_path(body, target_field, value)
+        return {
+            "method": "POST",
+            "url": f"{self.profile.base_url.rstrip('/')}{self.profile.path}",
+            "headers": dict(self._headers),
+            "body": body,
+        }
+
+    def send(self, case: AttackCase) -> QualifyResponse:
+        request = self.build_request(case)
         response = httpx.post(
-            f"{self.profile.base_url.rstrip('/')}{self.profile.path}",
-            json=body,
-            headers=self._headers,
+            request["url"],
+            json=request["body"],
+            headers=request["headers"],
             timeout=self.profile.timeout,
         )
         # Raises httpx.HTTPStatusError on a 4xx/5xx - deliberately NOT

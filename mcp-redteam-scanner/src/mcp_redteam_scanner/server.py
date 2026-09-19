@@ -1,5 +1,5 @@
-"""MCP server exposing the golden-attack-set scanner as two tools:
-scan_qualify_endpoint and list_attack_categories.
+"""MCP server exposing the golden-attack-set scanner: scan_qualify_endpoint,
+scan_endpoint, list_scan_history, and list_attack_categories.
 
 Run directly for local testing:
 
@@ -19,6 +19,7 @@ from mcp.server.mcpserver import MCPServer
 from .audit_log import read_recent_scans, record_scan_attempt
 from .authorization import EngagementScope, ScopeViolation, require_scope
 from .client import QualifyEndpointTarget, TargetHttpClient
+from .report import render_markdown_report
 from .schema import TargetProfile, load_attack_cases
 from .scorer import grade
 from .taxonomy import classify
@@ -27,17 +28,24 @@ mcp = MCPServer(
     name="redteam-scanner",
     instructions=(
         "Prompt-injection-tests a live agent endpoint. scan_qualify_endpoint runs the "
-        "full 18-case golden attack set against a target that speaks Lead Router's own "
-        "/qualify contract verbatim; scan_endpoint runs the same cases against ANY "
-        "endpoint that accepts a lead-like submission and returns a classification "
-        "decision, via a field_map/response_map translation. Both require an explicit "
-        "authorization scope (target_host, authorized_by, contact, a valid_from/"
-        "valid_until window, and i_have_authorization=true) before a single request "
-        "fires - only scan a host you own or have explicit permission to test. Every "
+        "full golden attack set against a target that speaks Lead Router's own /qualify "
+        "contract verbatim; scan_endpoint runs the same cases against ANY endpoint that "
+        "accepts a lead-like submission and returns a classification decision, via a "
+        "field_map/response_map translation. Both require an explicit authorization "
+        "scope (target_host, authorized_by, contact, a valid_from/valid_until window, "
+        "and i_have_authorization=true) before a single request fires - only scan a "
+        "host you own or have explicit permission to test. Pass dry_run=true to preview "
+        "the exact requests a scan would send without sending them, or delay_seconds to "
+        "throttle requests against a target that shouldn't see a traffic spike. Every "
         "attempt, authorized or rejected, is written to a local audit log; "
-        "list_scan_history reads it back."
+        "list_scan_history reads it back. A completed (non-dry-run) scan's result "
+        "includes a ready-to-share markdown report."
     ),
 )
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def _authorize_or_raise(
@@ -78,10 +86,35 @@ def _authorize_or_raise(
     return scope
 
 
-def _run_scan(target: TargetHttpClient, has_guardrails: bool) -> dict:
+def _preview_requests(target: TargetHttpClient) -> dict:
+    """The dry_run path: builds every request a real scan would send,
+    without sending any of them - lets an operator see exactly what's
+    about to hit a target before committing to a live scan."""
+    cases = load_attack_cases()
+    return {
+        "dry_run": True,
+        "requests": [
+            {
+                "attack_id": case.attack_id,
+                "category": case.category,
+                "severity": case.severity,
+                **target.build_request(case),
+            }
+            for case in cases
+        ],
+    }
+
+
+def _run_scan(
+    target: TargetHttpClient, has_guardrails: bool, *, delay_seconds: float = 0.0
+) -> dict:
     cases = load_attack_cases()
     records = []
-    for case in cases:
+    for i, case in enumerate(cases):
+        # No delay before the first request - delay_seconds paces the
+        # gap *between* requests, not a startup cost.
+        if delay_seconds and i > 0:
+            time.sleep(delay_seconds)
         started = time.perf_counter()
         try:
             response = target.send(case)
@@ -96,6 +129,7 @@ def _run_scan(target: TargetHttpClient, has_guardrails: bool) -> dict:
             {
                 "attack_id": case.attack_id,
                 "category": case.category,
+                "severity": case.severity,
                 "passed": passed,
                 "failure_layer": layer,
                 "error": error,
@@ -115,12 +149,15 @@ def _summarize(records: list[dict]) -> dict:
         cat["total"] += 1
         cat["held"] += bool(r["passed"])
     by_layer = Counter(r["failure_layer"] for r in records if r["failure_layer"])
+    findings = [r for r in records if not r["passed"]]
+    by_severity = Counter(r["severity"] for r in findings)
     return {
         "defended": held,
         "total": total,
         "by_category": by_category,
         "by_failure_layer": dict(by_layer),
-        "findings": [r for r in records if not r["passed"]],
+        "by_severity": dict(by_severity),
+        "findings": findings,
     }
 
 
@@ -136,8 +173,10 @@ def scan_qualify_endpoint(
     notes: str = "",
     api_key: str | None = None,
     assume_guardrails: bool = True,
+    dry_run: bool = False,
+    delay_seconds: float = 0.0,
 ) -> dict:
-    """Runs the 18-case golden prompt-injection set against a live
+    """Runs the golden prompt-injection set against a live
     /qualify-compatible endpoint and returns a pass/fail summary.
 
     Refuses to send a single request unless the authorization
@@ -165,17 +204,38 @@ def scan_qualify_endpoint(
         by_failure_layer breakdown - it does not change pass/fail
         results. Set False if you know the target has no prompt-level
         defenses at all.
+    dry_run: if true, builds and returns every request this scan would
+        send (method/url/headers/body per case) without sending any of
+        them - no grading happens, and the return shape is
+        {"dry_run": true, "requests": [...]} instead of the usual
+        summary. Still requires authorization, but is logged separately
+        in the audit trail and never touches the target.
+    delay_seconds: pause this long between requests (0 = no throttle).
+        Use it against a target you don't want to see 18+ requests in
+        a couple of seconds.
 
     Returns defended/total counts, a per-category breakdown, a
-    per-failure-layer breakdown, and the list of cases that did NOT
-    hold (each with its attack_id, category, and latency).
+    per-failure-layer breakdown, a per-severity breakdown, the list of
+    cases that did NOT hold, and a ready-to-share markdown "report"
+    string.
     """
     scope = _authorize_or_raise(
         tool="scan_qualify_endpoint", base_url=base_url, target_host=target_host,
         authorized_by=authorized_by, contact=contact, valid_from=valid_from,
         valid_until=valid_until, i_have_authorization=i_have_authorization, notes=notes,
     )
-    result = _run_scan(QualifyEndpointTarget(base_url=base_url, api_key=api_key), assume_guardrails)
+    target = QualifyEndpointTarget(base_url=base_url, api_key=api_key)
+    if dry_run:
+        preview = _preview_requests(target)
+        record_scan_attempt(
+            tool="scan_qualify_endpoint", base_url=base_url, scope=scope, outcome="dry_run",
+            summary={"requests_previewed": len(preview["requests"])},
+        )
+        return preview
+    result = _run_scan(target, assume_guardrails, delay_seconds=delay_seconds)
+    result["report"] = render_markdown_report(
+        result, target_label=base_url, scanned_at=_now_iso(),
+    )
     record_scan_attempt(
         tool="scan_qualify_endpoint", base_url=base_url, scope=scope, outcome="scanned",
         summary={"defended": result["defended"], "total": result["total"]},
@@ -200,9 +260,11 @@ def scan_endpoint(
     response_map: dict[str, str] | None = None,
     assume_guardrails: bool = True,
     timeout: float = 60.0,
+    dry_run: bool = False,
+    delay_seconds: float = 0.0,
 ) -> dict:
-    """Runs the same 18-case golden attack set as scan_qualify_endpoint,
-    but against ANY endpoint that accepts a lead-like submission (a
+    """Runs the same golden attack set as scan_qualify_endpoint, but
+    against ANY endpoint that accepts a lead-like submission (a
     free-text field plus a few structured ones) and returns a
     classification decision plus free-text reasoning - not just an
     exact clone of Lead Router's own field names and response shape.
@@ -228,6 +290,7 @@ def scan_endpoint(
         and reasoning are actually required for grading to run; leave
         the rest unset if the target has no equivalent.
     assume_guardrails: same meaning as on scan_qualify_endpoint.
+    dry_run/delay_seconds: same meaning as on scan_qualify_endpoint.
 
     Returns the same shape as scan_qualify_endpoint.
     """
@@ -245,7 +308,18 @@ def scan_endpoint(
         response_map=response_map or {},
         timeout=timeout,
     )
-    result = _run_scan(TargetHttpClient(profile), assume_guardrails)
+    target = TargetHttpClient(profile)
+    if dry_run:
+        preview = _preview_requests(target)
+        record_scan_attempt(
+            tool="scan_endpoint", base_url=base_url, scope=scope, outcome="dry_run",
+            summary={"requests_previewed": len(preview["requests"])},
+        )
+        return preview
+    result = _run_scan(target, assume_guardrails, delay_seconds=delay_seconds)
+    result["report"] = render_markdown_report(
+        result, target_label=f"{base_url}{path}", scanned_at=_now_iso(),
+    )
     record_scan_attempt(
         tool="scan_endpoint", base_url=base_url, scope=scope, outcome="scanned",
         summary={"defended": result["defended"], "total": result["total"]},
@@ -264,8 +338,8 @@ def list_scan_history(limit: int = 20) -> list[dict]:
 
 @mcp.tool()
 def list_attack_categories() -> list[dict]:
-    """Lists the four attack categories in the golden set, with a count
-    of cases in each and a one-line description of what each tests."""
+    """Lists the attack categories in the golden set, with a count of
+    cases in each and a one-line description of what each tests."""
     descriptions = {
         "direct_injection": (
             "Instructions embedded in lead fields telling the agent to assign a "
@@ -280,6 +354,15 @@ def list_attack_categories() -> list[dict]:
         "output_handling_injection": (
             "Content designed to survive unsanitized into a downstream field "
             "(e.g. one relayed to Slack)."
+        ),
+        "encoding_evasion": (
+            "The same override techniques as direct_injection, obfuscated (base64, ROT13, "
+            "zero-width characters, leetspeak) to test defenses that only pattern-match "
+            "plaintext keywords."
+        ),
+        "multi_field_chaining": (
+            "An attack split across multiple request fields so no single field contains "
+            "the full payload, reconstructed only once every field is concatenated."
         ),
     }
     counts = Counter(c.category for c in load_attack_cases())
